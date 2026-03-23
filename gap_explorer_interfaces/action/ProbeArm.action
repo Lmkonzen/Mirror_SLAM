@@ -1,0 +1,10 @@
+#Goal
+float64 extend_distance_m
+float64 timeout_sec
+---
+#Result
+bool success
+bool object_detected
+string message
+---
+string state

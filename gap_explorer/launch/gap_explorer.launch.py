@@ -10,10 +10,16 @@ def generate_launch_description():
 
     return LaunchDescription([
         Node(
+            package='ur3',
+            executable='arm_probe_server',
+            name='arm_probe_server',
+            output='screen',
+        ),
+        Node(
             package='gap_explorer',
             executable='gap_explorer',
             name='gap_explorer',
             output='screen',
             parameters=[params_file],
-        )
+        ),
     ])

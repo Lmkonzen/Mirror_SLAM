@@ -7,4 +7,5 @@ bool success
 bool object_detected
 string message
 ---
+#Feedback
 string state

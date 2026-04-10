@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import math
 import time
+import struct
 from collections import deque
 from typing import List, Optional, Tuple
 
@@ -16,7 +17,7 @@ from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import Point, PoseStamped, Twist
 from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import OccupancyGrid
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import LaserScan, PointCloud2, PointField
 from std_msgs.msg import Bool
 from visualization_msgs.msg import Marker, MarkerArray
 from gap_explorer_interfaces.action import ProbeArm
@@ -103,7 +104,7 @@ class GapExplorer(Node):
         self.probe_result_future = None
         self.probe_in_progress = False
         self.last_probe_detected = None
-
+        self._probed_wall = None
 
 
 
@@ -166,6 +167,7 @@ class GapExplorer(Node):
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.marker_pub = self.create_publisher(MarkerArray, '/gap_debug_markers', 10)
         self.probe_pub = self.create_publisher(Bool, '/gap_arm_trigger', 10)
+        self.mirror_cloud_pub = self.create_publisher(PointCloud2, '/detected_mirrors', 10)
 
         self.nav_client = ActionClient(self, NavigateToPose, '/navigate_to_pose')
         self.timer = self.create_timer(0.1, self.step)
@@ -203,6 +205,7 @@ class GapExplorer(Node):
         self.probe_until = 0.0
 
         self.completed_walls: List[dict] = []
+        self.detected_mirrors: List[dict] = []
 
     # ---------------- callbacks ----------------
 
@@ -253,6 +256,11 @@ class GapExplorer(Node):
             f'Probe finished: success={success}, object_detected={object_detected}, msg={message}'
         )
 
+        if object_detected and self._probed_wall is not None:
+            self.remember_mirror(self._probed_wall)
+
+        self._probed_wall = None
+
         # Clear wall-follow state and continue only after probe completes
         self.clear_locked_wall()
         self.scan_buffer.clear()
@@ -260,7 +268,6 @@ class GapExplorer(Node):
         self.last_segments = []
         self.state_deadline = time.time() + self.startup_scan_sec
         self.state = 'COLLECT'
-
 
     def shorten_plan_until_safe(self, plan: dict) -> Optional[dict]:
         start = np.array(plan['start_point'], dtype=float)
@@ -590,7 +597,70 @@ class GapExplorer(Node):
             f"Saved completed wall: center=({sig['center'][0]:.2f}, {sig['center'][1]:.2f}) "
             f"angle={math.degrees(sig['angle']):.1f} len={sig['length']:.2f}"
         )
- 
+        
+    def mirror_matches(self, wall: dict) -> bool:
+        """True if this wall signature is already in detected_mirrors."""
+        sig = self.canonical_wall_signature(wall)
+        for done in self.detected_mirrors:
+            d_center = float(np.linalg.norm(sig['center'] - done['center']))
+            da = abs(sig['angle'] - done['angle'])
+            da = min(da, abs(da - math.pi))
+            e00 = float(np.linalg.norm(sig['p0'] - done['p0']))
+            e11 = float(np.linalg.norm(sig['p1'] - done['p1']))
+            e01 = float(np.linalg.norm(sig['p0'] - done['p1']))
+            e10 = float(np.linalg.norm(sig['p1'] - done['p0']))
+            endpoint_err = min(e00 + e11, e01 + e10)
+            if d_center < self.completed_wall_match_dist_m and da < self.completed_wall_match_angle:
+                return True
+            if endpoint_err < 2.0 * self.completed_wall_match_dist_m and da < self.completed_wall_match_angle:
+                return True
+        return False
+
+    def remember_mirror(self, wall: dict):
+        """Store a wall as a detected mirror (same format as completed_walls)."""
+        if self.mirror_matches(wall):
+            return
+        sig = self.canonical_wall_signature(wall)
+        self.detected_mirrors.append(sig)
+        self.get_logger().info(
+            f"Mirror detected: center=({sig['center'][0]:.2f}, {sig['center'][1]:.2f}) "
+            f"angle={math.degrees(sig['angle']):.1f} len={sig['length']:.2f}"
+        )
+        self._publish_mirror_cloud()
+
+    def _publish_mirror_cloud(self):
+        """Republish all detected mirror centers as a PointCloud2 for Nav2 obstacle layer."""
+        points = []
+        for m in self.detected_mirrors:
+            c = m['center']
+            # Publish several points along the mirror segment so the costmap inflates a line, not just a dot
+            t = np.array([math.cos(m['angle']), math.sin(m['angle'])], dtype=float)
+            half = 0.5 * m['length']
+            steps = max(3, int(m['length'] / 0.05))
+            for i in range(steps + 1):
+                s = -half + (2.0 * half * i / steps)
+                p = c + s * t
+                points.append((float(p[0]), float(p[1]), 0.1))
+
+        msg = PointCloud2()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self.global_frame
+        msg.height = 1
+        msg.width = len(points)
+        msg.fields = [
+            PointField(name='x', offset=0,  datatype=PointField.FLOAT32, count=1),
+            PointField(name='y', offset=4,  datatype=PointField.FLOAT32, count=1),
+            PointField(name='z', offset=8,  datatype=PointField.FLOAT32, count=1),
+        ]
+        msg.is_bigendian = False
+        msg.point_step = 12
+        msg.row_step = 12 * len(points)
+        msg.is_dense = True
+        msg.data = bytearray()
+        for (x, y, z) in points:
+            msg.data += struct.pack('fff', x, y, z)
+
+        self.mirror_cloud_pub.publish(msg)
     # ---------------- wall extraction ----------------
 
     def scan_points_robot(self, scan: LaserScan):
@@ -687,7 +757,8 @@ class GapExplorer(Node):
             s for s in all_segments
             if not self.completed_wall_matches(s)
             and not self.candidate_near_completed_wall(s)
-        ]
+            and not self.mirror_matches(s)
+]
         self.last_segments = all_segments
 
         if not all_segments:
@@ -939,7 +1010,8 @@ class GapExplorer(Node):
     # ---------------- nav2 ----------------
 
     def send_nav_goal(self, x: float, y: float, yaw: float) -> bool:
-        if not self.nav_client.wait_for_server(timeout_sec=0.5):
+        if not self.nav_client.wait_for_server(timeout_sec=5.0):
+            self.get_logger().warn('Nav2 action server not available')
             return False
 
         goal = NavigateToPose.Goal()
@@ -978,6 +1050,9 @@ class GapExplorer(Node):
             self.get_logger().warn('Probe action server not available')
             self.finish_probe(False, False, 'Probe server unavailable')
             return
+
+        # Snapshot the wall being probed so finish_probe can store it if a mirror is detected
+        self._probed_wall = dict(self.locked_wall) if self.locked_wall is not None else None
 
         goal = ProbeArm.Goal()
         goal.extend_distance_m = 0.20
@@ -1140,6 +1215,13 @@ class GapExplorer(Node):
             half = 0.5 * done['length'] * t
             add_line(c - half, c + half, 'completed_walls', (0.2, 0.2, 0.2), 0.04)
 
+        for m in self.detected_mirrors:
+            c = m['center']
+            t = np.array([math.cos(m['angle']), math.sin(m['angle'])], dtype=float)
+            half = 0.5 * m['length'] * t
+            add_line(c - half, c + half, 'detected_mirrors', (0.0, 0.8, 1.0), 0.06)
+            add_sphere(c, 'mirror_centers', (0.0, 0.8, 1.0), 0.14)
+        
         self.marker_pub.publish(ma)
 
     # ---------------- state machine ----------------
@@ -1172,20 +1254,24 @@ class GapExplorer(Node):
                             self.state_deadline = time.time() + self.startup_scan_sec
                 else:
                     plan = self.choose_initial_plan(best)
-                    self.lock_plan(plan)
-                    self.get_logger().info(
-                        f"Selected a new wall. Following wall on {self.active_follow_side}. Sending Nav2 goal"
-                    )
-                    ok = self.send_nav_goal(
-                        float(plan['start_point'][0]),
-                        float(plan['start_point'][1]),
-                        float(plan['heading'])
-                    )
-                    if ok:
-                        self.nav_purpose = 'wall_start'
-                        self.state = 'NAV'
+                    if plan is None:
+                        self.get_logger().warn('No safe approach plan for selected wall; rescanning')
+                        self.state_deadline = time.time() + self.startup_scan_sec
                     else:
-                        self.state = 'FOLLOW'
+                        self.lock_plan(plan)
+                        self.get_logger().info(
+                            f"Selected a new wall. Following wall on {self.active_follow_side}. Sending Nav2 goal"
+                        )
+                        ok = self.send_nav_goal(
+                            float(plan['start_point'][0]),
+                            float(plan['start_point'][1]),
+                            float(plan['heading'])
+                        )
+                        if ok:
+                            self.nav_purpose = 'wall_start'
+                            self.state = 'NAV'
+                        else:
+                            self.state = 'FOLLOW'
 
 
         elif self.state == 'NAV':

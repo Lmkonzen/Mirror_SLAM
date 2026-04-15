@@ -18,7 +18,6 @@ from geometry_msgs.msg import Point, PoseStamped, Twist
 from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import LaserScan, PointCloud2, PointField
-from std_msgs.msg import Bool
 from visualization_msgs.msg import Marker, MarkerArray
 from gap_explorer_interfaces.action import ProbeArm
 
@@ -105,7 +104,9 @@ class GapExplorer(Node):
         self.probe_in_progress = False
         self.last_probe_detected = None
         self._probed_wall = None
-
+        self._approach_strike_count = 0
+        self._approach_strike_wall = None
+        self._approach_strike_limit = 3
 
 
 
@@ -115,25 +116,11 @@ class GapExplorer(Node):
         self.explore_cost_weight = float(self.get_parameter('explore_cost_weight').value)
         self.explore_dist_weight = float(self.get_parameter('explore_dist_weight').value)
         self.explore_dir_weight = float(self.get_parameter('explore_dir_weight').value)
-        self.explore_probe_radius_m = float(self.get_parameter('explore_probe_radius_m').value)
-        self.explore_open_probe_points = int(self.get_parameter('explore_open_probe_points').value)
-        self.explore_turn_weight = float(self.get_parameter('explore_turn_weight').value)
-        self.explore_open_weight = float(self.get_parameter('explore_open_weight').value)
         self.global_frame = str(self.get_parameter('global_frame').value)
         self.robot_base_frame = str(self.get_parameter('robot_base_frame').value)
         self.tf_timeout_sec = float(self.get_parameter('tf_timeout_sec').value)
-        self.loop_recovery_events_before_explore = int(
-            self.get_parameter('loop_recovery_events_before_explore').value
-        )
-        self.loop_recovery_cooldown_sec = float(
-            self.get_parameter('loop_recovery_cooldown_sec').value
-        )
         self.follow_clearance_radius_m = float(self.get_parameter('follow_clearance_radius_m').value)
-        self.explore_goal_min_m = float(self.get_parameter('explore_goal_min_m').value)
-        self.explore_goal_max_m = float(self.get_parameter('explore_goal_max_m').value)
         self.explore_goal_clearance_m = float(self.get_parameter('explore_goal_clearance_m').value)
-        self.explore_goal_heading_weight = float(self.get_parameter('explore_goal_heading_weight').value)
-        self.explore_goal_distance_weight = float(self.get_parameter('explore_goal_distance_weight').value)
         self.nav_purpose = None
         self.startup_scan_sec = float(self.get_parameter('startup_scan_sec').value)
         self.post_nav_pause_sec = float(self.get_parameter('post_nav_pause_sec').value)
@@ -145,7 +132,6 @@ class GapExplorer(Node):
         self.cross_track_kp = float(self.get_parameter('cross_track_kp').value)
         self.lookahead_m = float(self.get_parameter('lookahead_m').value)
         self.endpoint_margin = float(self.get_parameter('endpoint_reach_margin_m').value)
-        self.probe_pause_sec = float(self.get_parameter('probe_pause_sec').value)
 
         self.max_candidate_range_m = float(self.get_parameter('max_candidate_range_m').value)
         self.max_range_jump_m = float(self.get_parameter('max_range_jump_m').value)
@@ -166,7 +152,6 @@ class GapExplorer(Node):
 
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.marker_pub = self.create_publisher(MarkerArray, '/gap_debug_markers', 10)
-        self.probe_pub = self.create_publisher(Bool, '/gap_arm_trigger', 10)
         self.mirror_cloud_pub = self.create_publisher(PointCloud2, '/detected_mirrors', 10)
 
         self.nav_client = ActionClient(self, NavigateToPose, '/navigate_to_pose')
@@ -177,16 +162,11 @@ class GapExplorer(Node):
 
         self.scan: Optional[LaserScan] = None
         self.scan_buffer = deque(maxlen=50)
-        self.have_odom = False
         self.x = 0.0
         self.y = 0.0
         self.yaw = 0.0
         self.costmap: Optional[OccupancyGrid] = None
         self.cost_np: Optional[np.ndarray] = None
-
-        self.loop_recovery_events = 0
-        self.last_loop_recovery_time = 0.0
-
         self.state = 'COLLECT'
         self.state_deadline = time.time() + self.startup_scan_sec
         self.nav_status = None
@@ -202,7 +182,6 @@ class GapExplorer(Node):
         self.wall_last_local_shift = 0.0
 
         self.last_segments: List[dict] = []
-        self.probe_until = 0.0
 
         self.completed_walls: List[dict] = []
         self.detected_mirrors: List[dict] = []
@@ -371,7 +350,6 @@ class GapExplorer(Node):
         self.x = float(t.x)
         self.y = float(t.y)
         self.yaw = yaw_from_quat(r)
-        self.have_odom = True
         return True
 
     def stop(self):
@@ -734,17 +712,6 @@ class GapExplorer(Node):
             'angle_w': ang
         }
 
-    def segment_candidates(self) -> List[dict]:
-        if self.scan is None:
-            return []
-        segs = []
-        for raw in self.contiguous_segments(self.scan_points_robot(self.scan)):
-            fit = self.fit_segment(raw)
-            if fit is not None:
-                segs.append(self.segment_to_world(fit))
-        self.last_segments = segs
-        return segs
-
     def select_best_wall(self) -> Optional[dict]:
         all_segments = []
         for sc in list(self.scan_buffer)[-min(20, len(self.scan_buffer)):]:
@@ -1055,8 +1022,6 @@ class GapExplorer(Node):
         self._probed_wall = dict(self.locked_wall) if self.locked_wall is not None else None
 
         goal = ProbeArm.Goal()
-        goal.extend_distance_m = 0.20
-        goal.timeout_sec = 8.0
 
         send_future = self.probe_client.send_goal_async(
             goal,
@@ -1100,7 +1065,6 @@ class GapExplorer(Node):
             return
 
         s = max(0.0, min(L, float(np.dot(robot - start, t))))
-        remaining = L - s
 
         chase = start + min(L, s + self.lookahead_m) * t
         nearest = start + s * t
@@ -1255,9 +1219,45 @@ class GapExplorer(Node):
                 else:
                     plan = self.choose_initial_plan(best)
                     if plan is None:
-                        self.get_logger().warn('No safe approach plan for selected wall; rescanning')
-                        self.state_deadline = time.time() + self.startup_scan_sec
+                        # Check if we keep failing on the same wall
+                        best_sig = self.canonical_wall_signature(best)
+                        if (self._approach_strike_wall is not None and
+                                float(np.linalg.norm(
+                                    best_sig['center'] - self._approach_strike_wall['center']
+                                )) < self.completed_wall_match_dist_m):
+                            self._approach_strike_count += 1
+                        else:
+                            self._approach_strike_count = 1
+                            self._approach_strike_wall = best_sig
+
+                        if self._approach_strike_count >= self._approach_strike_limit:
+                            self.get_logger().warn(
+                                f'Wall at ({best_sig["center"][0]:.2f}, {best_sig["center"][1]:.2f}) '
+                                f'failed approach {self._approach_strike_count} times, skipping it'
+                            )
+                            self.remember_completed_wall(best)
+                            self._approach_strike_count = 0
+                            self._approach_strike_wall = None
+                            # Try to explore somewhere new instead
+                            explore_goal = self.choose_explore_goal()
+                            if explore_goal is not None:
+                                gx, gy, gyaw = explore_goal
+                                ok = self.send_nav_goal(gx, gy, gyaw)
+                                if ok:
+                                    self.last_explore_yaw = gyaw
+                                    self.nav_purpose = 'explore'
+                                    self.state = 'NAV'
+                                    return
+                            self.state_deadline = time.time() + self.startup_scan_sec
+                        else:
+                            self.get_logger().warn(
+                                f'No safe approach plan for selected wall '
+                                f'(strike {self._approach_strike_count}/{self._approach_strike_limit}); rescanning'
+                            )
+                            self.state_deadline = time.time() + self.startup_scan_sec
                     else:
+                        self._approach_strike_count = 0
+                        self._approach_strike_wall = None
                         self.lock_plan(plan)
                         self.get_logger().info(
                             f"Selected a new wall. Following wall on {self.active_follow_side}. Sending Nav2 goal"

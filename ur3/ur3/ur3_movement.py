@@ -14,8 +14,8 @@ from gap_explorer_interfaces.action import ProbeArm
 HOME_JOINTS = [0.02, -1.57, 0.0, -1.39, 1.47, 0.0]
 POKE_JOINTS = [0.00, -2.5, 0.07, -0.29, 1.49, 0.0]
 JOINT_NAMES = [
-    "shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
-    "wrist_1_joint", "wrist_2_joint", "wrist_3_joint",
+    "arm_shoulder_pan_joint", "arm_shoulder_lift_joint", "arm_elbow_joint",
+    "arm_wrist_1_joint", "arm_wrist_2_joint", "arm_wrist_3_joint",
 ]
 
 
@@ -24,9 +24,16 @@ class ArmProbeServer(Node):
         super().__init__('arm_probe_server')
         cb = ReentrantCallbackGroup()
 
-        self._move_client = ActionClient(self, MoveGroup, '/move_action',
+        # When the UR stack runs inside the /ur3e namespace (see
+        # ur_isolated.launch.py), MoveIt's action server lives at
+        # /ur3e/move_action.  This parameter lets callers override it
+        # for setups that don't use the namespace.
+        self.declare_parameter('move_action_topic', '/move_action')
+        move_topic = self.get_parameter('move_action_topic').value
+
+        self._move_client = ActionClient(self, MoveGroup, move_topic,
                                          callback_group=cb)
-        self.get_logger().info('Waiting for /move_action...')
+        self.get_logger().info(f'Waiting for {move_topic}...')
         self._move_client.wait_for_server()
         self.get_logger().info('Connected.')
 

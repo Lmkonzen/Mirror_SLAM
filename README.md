@@ -87,8 +87,8 @@ ros2 run ur3 probe_server --ros-args -p use_sim_time:=true
 ```bash
 source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash
 ros2 launch nav2_bringup tb3_simulation_launch.py \
-    world:=$HOME/ros2_ws/src/Mirror_SLAM_clean/mirror_slam_bringup/worlds/simpleroom.sdf.xacro \
-    params_file:=$HOME/ros2_ws/src/Mirror_SLAM_clean/mirror_slam_bringup/params/nav2_params.yaml \
+    world:=$HOME/ros2_ws/src/Mirror_SLAM/mirror_slam_bringup/worlds/simpleroom.sdf.xacro \
+    params_file:=$HOME/ros2_ws/src/Mirror_SLAM/mirror_slam_bringup/params/nav2_params.yaml \
     x_pose:=2.0 y_pose:=0.0 z_pose:=0.1 slam:=True headless:=True
 ```
 
